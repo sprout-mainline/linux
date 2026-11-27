@@ -208,15 +208,38 @@ static int qcom_smd_qrtr_device_unregister(struct device *dev, void *data)
 	return 0;
 }
 
-/* from smd to qrtr */
-static int qcom_smd_qrtr_callback(struct rpmsg_device *rpdev,
-				  void *data, int len, void *priv, u32 addr)
-{
-	struct qrtr_smd_dev *qsdev = dev_get_drvdata(&rpdev->dev);
-	int rc;
+/* The rpmsg core opens the channel before it calls our probe, so the remote
+ * may send packets before the QRTR endpoint is registered. SMD retries a
+ * packet whose callback fails, but GLINK drops it, and losing the remote's
+ * HELLO this way leaves the link without any service announcements. Packets
+ * that arrive while probe is running are therefore held here and posted
+ * once the endpoint is registered.
+ */
+struct qrtr_smd_early_rx {
+	struct list_head node;
+	struct rpmsg_device *rpdev;
+	struct sk_buff_head queue;
+};
 
-	if (!qsdev)
-		return -EAGAIN;
+static LIST_HEAD(qrtr_smd_early_rx_list);
+static DEFINE_SPINLOCK(qrtr_smd_early_rx_lock);
+
+static struct qrtr_smd_early_rx *qcom_smd_qrtr_early_rx(struct rpmsg_device *rpdev)
+{
+	struct qrtr_smd_early_rx *early;
+
+	lockdep_assert_held(&qrtr_smd_early_rx_lock);
+
+	list_for_each_entry(early, &qrtr_smd_early_rx_list, node)
+		if (early->rpdev == rpdev)
+			return early;
+
+	return NULL;
+}
+
+static int qcom_smd_qrtr_post(struct qrtr_smd_dev *qsdev, void *data, int len)
+{
+	int rc;
 
 	rc = qrtr_endpoint_post(&qsdev->ep, data, len);
 	if (rc == -EINVAL) {
@@ -226,6 +249,102 @@ static int qcom_smd_qrtr_callback(struct rpmsg_device *rpdev,
 	}
 
 	return rc;
+}
+
+static int qcom_smd_qrtr_hold(struct rpmsg_device *rpdev, void *data, int len)
+{
+	struct qrtr_smd_early_rx *early;
+	struct qrtr_smd_dev *qsdev;
+	struct sk_buff *skb;
+	unsigned long flags;
+	int rc = 0;
+
+	spin_lock_irqsave(&qrtr_smd_early_rx_lock, flags);
+
+	/* probe may have finished in the meantime */
+	qsdev = dev_get_drvdata(&rpdev->dev);
+	if (qsdev) {
+		rc = qcom_smd_qrtr_post(qsdev, data, len);
+		goto out;
+	}
+
+	/* Still bound means we are past remove: drop, as before */
+	if (device_is_bound(&rpdev->dev)) {
+		rc = -EAGAIN;
+		goto out;
+	}
+
+	early = qcom_smd_qrtr_early_rx(rpdev);
+	if (!early) {
+		early = kzalloc_obj(*early, GFP_ATOMIC);
+		if (!early) {
+			rc = -ENOMEM;
+			goto out;
+		}
+		early->rpdev = rpdev;
+		skb_queue_head_init(&early->queue);
+		list_add_tail(&early->node, &qrtr_smd_early_rx_list);
+	}
+
+	skb = alloc_skb(len, GFP_ATOMIC);
+	if (!skb) {
+		rc = -ENOMEM;
+		goto out;
+	}
+	skb_put_data(skb, data, len);
+	__skb_queue_tail(&early->queue, skb);
+
+out:
+	spin_unlock_irqrestore(&qrtr_smd_early_rx_lock, flags);
+
+	return rc;
+}
+
+/* Post the packets held during probe, then publish @qsdev so the callback
+ * posts directly. Both happen under the lock, so held packets are posted
+ * before any packet that arrives later. With @qsdev NULL (probe failed),
+ * free them instead.
+ */
+static unsigned int qcom_smd_qrtr_flush_early_rx(struct rpmsg_device *rpdev,
+						 struct qrtr_smd_dev *qsdev)
+{
+	struct qrtr_smd_early_rx *early;
+	unsigned int count = 0;
+	struct sk_buff *skb;
+	unsigned long flags;
+
+	spin_lock_irqsave(&qrtr_smd_early_rx_lock, flags);
+
+	early = qcom_smd_qrtr_early_rx(rpdev);
+	if (early) {
+		list_del(&early->node);
+		while ((skb = __skb_dequeue(&early->queue))) {
+			if (qsdev)
+				qcom_smd_qrtr_post(qsdev, skb->data, skb->len);
+			kfree_skb(skb);
+			count++;
+		}
+		kfree(early);
+	}
+
+	if (qsdev)
+		dev_set_drvdata(&rpdev->dev, qsdev);
+
+	spin_unlock_irqrestore(&qrtr_smd_early_rx_lock, flags);
+
+	return count;
+}
+
+/* from smd to qrtr */
+static int qcom_smd_qrtr_callback(struct rpmsg_device *rpdev,
+				  void *data, int len, void *priv, u32 addr)
+{
+	struct qrtr_smd_dev *qsdev = dev_get_drvdata(&rpdev->dev);
+
+	if (!qsdev)
+		return qcom_smd_qrtr_hold(rpdev, data, len);
+
+	return qcom_smd_qrtr_post(qsdev, data, len);
 }
 
 /* from qrtr to smd */
@@ -251,11 +370,14 @@ out:
 static int qcom_smd_qrtr_probe(struct rpmsg_device *rpdev)
 {
 	struct qrtr_smd_dev *qsdev;
+	unsigned int held;
 	int rc;
 
 	qsdev = devm_kzalloc(&rpdev->dev, sizeof(*qsdev), GFP_KERNEL);
-	if (!qsdev)
+	if (!qsdev) {
+		qcom_smd_qrtr_flush_early_rx(rpdev, NULL);
 		return -ENOMEM;
+	}
 
 	qsdev->channel = rpdev->ept;
 	qsdev->dev = &rpdev->dev;
@@ -264,12 +386,15 @@ static int qcom_smd_qrtr_probe(struct rpmsg_device *rpdev)
 	qsdev->ep.del_device = qcom_smd_qrtr_del_device;
 
 	rc = qrtr_endpoint_register(&qsdev->ep, QRTR_EP_NID_AUTO);
-	if (rc)
+	if (rc) {
+		qcom_smd_qrtr_flush_early_rx(rpdev, NULL);
 		return rc;
+	}
 
-	dev_set_drvdata(&rpdev->dev, qsdev);
+	held = qcom_smd_qrtr_flush_early_rx(rpdev, qsdev);
 
-	dev_dbg(&rpdev->dev, "Qualcomm SMD QRTR driver probed\n");
+	dev_dbg(&rpdev->dev, "Qualcomm SMD QRTR driver probed, held packets: %u\n",
+		held);
 
 	return 0;
 }
@@ -315,8 +440,16 @@ static int __init qcom_smd_qrtr_init(void)
 
 static void __exit qcom_smd_qrtr_exit(void)
 {
+	struct qrtr_smd_early_rx *early, *tmp;
+
 	bus_unregister(&qrtr_bus);
 	unregister_rpmsg_driver(&qcom_smd_qrtr_driver);
+
+	/* Only a failed probe can leave held packets behind */
+	list_for_each_entry_safe(early, tmp, &qrtr_smd_early_rx_list, node) {
+		skb_queue_purge(&early->queue);
+		kfree(early);
+	}
 }
 
 subsys_initcall(qcom_smd_qrtr_init);
